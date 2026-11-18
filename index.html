@@ -118,6 +118,7 @@ details summary { cursor: pointer; color: var(--ink-2); font-size: 14px; }
 #c-ldmap .st:focus, #c-ldmap .dot:focus { outline: none; } #c-ldmap .st:focus-visible, #c-ldmap .dot:focus-visible { stroke: var(--kalshi); stroke-width: 2.5; }
 .legend.mapkey { margin-left: 0; gap: 6px 12px; font-size: 12px; }
 #c-ldshare { cursor: ew-resize; }
+.seg button:disabled { color: var(--muted); opacity: 0.55; cursor: not-allowed; }
 .tile.on { cursor: pointer; } .tile.on:focus { outline: none; } .tile.on:focus-visible rect { stroke: var(--kalshi); stroke-width: 3; }
 .swatch, .legend i.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 5px; }
 .legend i.dash { height: 0; background: none; border-top: 2px dashed; }
@@ -247,6 +248,7 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--wash); } tr.
       <div class="controls">
         <div class="ctl"><span>Office</span><div class="seg" role="group" aria-label="Office on the map" id="ld-office"></div></div>
         <div class="ctl"><span>Color the map by</span><div class="seg" role="group" aria-label="Color the map by" id="ld-mode"></div></div>
+        <div class="ctl"><span>View</span><div class="seg" role="group" aria-label="Tiles or map" id="ld-view"></div></div>
       </div>
       <div class="timebar">
         <button class="play" id="ld-play" type="button">Play</button>
@@ -257,6 +259,7 @@ tr.click { cursor: pointer; } tr.click:hover td { background: var(--wash); } tr.
         <div class="panel" id="ld-map-panel">
           <h3 id="ld-map-h"></h3>
           <svg class="chart map" id="c-ldmap" viewBox="0 0 975 610" role="img" aria-label="Map of the races, colored for the date on the slider"></svg>
+          <svg class="chart map" id="c-ldtiles" role="img" aria-label="Tile map, one square per state with its lead time in days, colored for the date on the slider"></svg>
           <p class="small setnote" id="ld-map-fallback" hidden>The map needs d3 from cdnjs, which did not load. The slider and the race chart still work.</p>
           <div class="legend mapkey" id="ld-key" aria-hidden="true"></div>
           <svg class="chart" id="c-ldshare" role="img" aria-label="Share of the races in each group by day; drag along it to move the date"></svg>
@@ -872,7 +875,7 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
     const locked = (r, j) => lam(r) > 0 && LD.h[j] <= lam(r) + 0.006;
     const ago = (j) => LD.h[j] < 1 ? Math.round(LD.h[j] * 24) + " hours" : Math.round(LD.h[j]) + " days";
     const whenOf = (j) => `${dateOf(j)} (${ago(j)} before)`;
-    Object.assign(ld, { mode: "lam", t: T - 1, playing: null });
+    Object.assign(ld, { mode: "lam", t: T - 1, playing: null, view: "tiles" });
     const LBIN = [[7, "1\u20137 days"], [30, "8\u201330"], [90, "31\u201390"], [180, "91\u2013180"], [365, "181\u2013365"], [1e9, "366+"]];
     const MODES = [["lam", "When it locked in (\u03bb)"], ["pc", "Polls + prices vs polls only"], ["kq", "Kalshi vs polls"]];
     function binFor(r, j) {
@@ -923,7 +926,7 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
       const gS = el("g", {}, msvg); gDots = el("g", {}, msvg);
       for (const f of LD.states) { const p = el("path", { d: gp(f), class: "st" }, gS); p.__c = gp.centroid(f); statePaths[f.properties.state] = p; }
       for (const r of LD.races) if (r.office === "House" && r.pt) { const xy = proj(r.pt); if (xy) r.xy = xy; }
-    } else { msvg.hidden = true; $("ld-map-fallback").hidden = false; }
+    } else { msvg.toggleAttribute("hidden", true); $("ld-map-fallback").hidden = false; }
     function buildMap() {
       if (!HAS_MAP) return;
       const by = {}; if (ld.office !== "House") for (const r of LD.races) if (r.office === ld.office) by[r.state] = r;
@@ -947,6 +950,7 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
         for (const p of Object.values(statePaths)) { const r = p.__race; p.setAttribute("fill", r ? KC[bins.get(r.id)] : none); p.classList.toggle("sel", !!r && r.id === ld.race); }
         for (const c of mapDots) { const r = c.__race, s = r.id === ld.race; c.setAttribute("fill", KC[bins.get(r.id)]); c.classList.toggle("sel", s); c.setAttribute("r", s ? 6.5 : 4.6); if (s && c !== gDots.lastChild) gDots.appendChild(c); }
       }
+      paintTiles(j, KC, bins, none);
       const c = (b) => cnt[b] || 0, head = `${ld.office} \u00b7 ${dateOf(j)}: `;
       $("ld-map-h").textContent = ld.mode === "lam"
         ? head + `locked in for ${n - c("n")} of ${n} races` + (j === T - 1 ? `; never (\u03bb = 0) in ${c("n")}` : "")
@@ -955,14 +959,62 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
                              : `locked in for ${c("lock")} of ${n}. This setting's daily forecasts aren't in the page, so only the lock-in shows.`)
           : head + `Kalshi closer in ${c("k-strong") + c("k-mild")} of ${n}, polls in ${c("p-strong") + c("p-mild")}, about the same in ${c("tie")}, not both yet in ${c("one")}`;
     }
-    function drawMap() { buildMap(); drawKey(); paintMap(); }
-    function mapTip(r, cxy) {
+    // tile map ("cubes"): one square per state with its lambda in days, the default view for Senate and Governor
+    const TILES = { AK: [0, 0], ME: [0, 11], VT: [1, 10], NH: [1, 11] };
+    [["WA ID MT ND MN IL WI MI NY RI MA", 2, 1], ["OR NV WY SD IA IN OH PA NJ CT", 3, 1], ["CA UT CO NE MO KY WV VA MD DE", 4, 1], ["AZ NM KS AR TN NC SC DC", 5, 2], ["OK LA MS AL GA", 6, 4]]
+      .forEach(([row_, r0, c0]) => row_.split(" ").forEach((st, k) => { TILES[st] = [r0, c0 + k]; }));
+    Object.assign(TILES, { HI: [7, 1], TX: [7, 4], FL: [7, 9] });
+    const lum = (hex) => { const m = hex.replace("#", ""); if (!/^[0-9a-f]{6}$/i.test(m)) return 0.5; const c = [0, 2, 4].map((i) => parseInt(m.substr(i, 2), 16) / 255).map((v) => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)); return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]; };
+    const tsvg = $("c-ldtiles"); let tileEls = [], tPatBg, tPatLn;
+    const useTiles = () => ld.view === "tiles" && ld.office !== "House";
+    const numFor = (r, j) => locked(r, j) ? (lam(r) >= LAST ? Math.round(lam(r)) + "+" : String(Math.round(lam(r)))) : (j === T - 1 ? "0" : "");
+    function buildTiles() {
+      tsvg.replaceChildren(); tileEls = [];
+      if (!useTiles()) return;
+      const W = Math.max(300, tsvg.parentElement.clientWidth - 28), cols = 12, rows = 8, gap = 4;
+      const sz = Math.min(56, Math.floor((W - gap * (cols - 1)) / cols)), H = rows * (sz + gap), big = sz >= 38;
+      tsvg.setAttribute("viewBox", `0 0 ${W} ${H}`); tsvg.style.height = H + "px"; tsvg.__W = W;
+      const pat = el("pattern", { id: "ldhatch2", width: 6, height: 6, patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, el("defs", {}, tsvg));
+      tPatBg = el("rect", { width: 6, height: 6 }, pat); tPatLn = el("line", { x1: 0, y1: 0, x2: 0, y2: 6, "stroke-width": 2 }, pat);
+      const x0 = (W - (cols * sz + (cols - 1) * gap)) / 2, by = {};
+      for (const r of LD.races) if (r.office === ld.office) by[r.state] = r;
+      for (const [st, [row, col]] of Object.entries(TILES)) {
+        const r = by[st] || null, x = x0 + col * (sz + gap), y = row * (sz + gap);
+        const g = el("g", r ? { class: "tile on", tabindex: 0, role: "button", "aria-label": r.label } : { class: "tile" }, tsvg);
+        const rect = el("rect", { x, y, width: sz, height: sz, rx: 4, "stroke-width": 2 }, g);
+        const t1 = txt("text", { x: x + sz / 2, y: big && r ? y + sz * 0.43 : y + sz / 2 + 4, "text-anchor": "middle" }, st, g);
+        t1.style.font = `600 ${sz < 34 ? 10 : 12}px var(--f-data)`;
+        const t2 = big && r ? txt("text", { x: x + sz / 2, y: y + sz * 0.8, "text-anchor": "middle" }, "", g) : null;
+        if (t2) t2.style.font = "500 11.5px var(--f-data)";
+        const dot = r && r.n_polls === 0 ? el("circle", { cx: x + sz - 7, cy: y + 7, r: 2.5 }, g) : null;
+        g.__race = r; g.__c = [x + sz / 2, y + sz / 2];
+        tileEls.push({ rect, t1, t2, dot, r });
+      }
+    }
+    function paintTiles(j, KC, bins, none) {
+      if (!useTiles() || !tPatBg) return;
+      tPatBg.setAttribute("fill", none); tPatLn.setAttribute("stroke", css("--hatch"));
+      const ink0 = css("--ink"), muted = css("--muted");
+      for (const t of tileEls) {
+        const r = t.r; let fill = none, ink = muted;
+        if (r) { const b = bins.get(r.id); fill = b === "one" ? "url(#ldhatch2)" : KC[b]; ink = b === "one" ? ink0 : (lum(fill) > 0.3 ? "#0b0b0b" : "#ffffff"); }
+        t.rect.setAttribute("fill", fill); t.rect.setAttribute("stroke", r && r.id === ld.race ? ink0 : "none");
+        t.t1.style.fill = ink; if (t.dot) t.dot.setAttribute("fill", ink);
+        if (t.t2) { t.t2.textContent = numFor(r, j); t.t2.style.fill = ink; }
+      }
+    }
+    function drawMap() {
+      const tiles = useTiles();
+      msvg.toggleAttribute("hidden", tiles || !HAS_MAP); tsvg.toggleAttribute("hidden", !tiles); $("ld-map-fallback").hidden = tiles || HAS_MAP;
+      buildMap(); buildTiles(); drawKey(); paintMap();
+    }
+    function mapTip(r, cxy, svgEl = msvg, scaleW = 975) {
       const j = ld.t, label = Object.fromEntries(keys().map(([b, , name]) => [b, name]));
       tipRows($("tip3"), `${r.label} \u00b7 ${dateOf(j)}`,
         [[css("--polls"), "Polls only", pct(at(PS(), r, j))], [css("--kalshi"), "Kalshi price", pct(at(SER.q, r, j))], [css("--comb"), "Polls + prices", pct(at(PCS(), r, j)), true],
          [null, "\u03bb, this setting", dTxt(lam(r)) + " days"], [null, "Polls \u00b7 won by", `${r.n_polls} \u00b7 ${r.y ? "Democrat" : "Republican"}`]],
         (label[binFor(r, j)] || "") + ". Click to open the race.");
-      const sb = msvg.getBoundingClientRect(), pb = $("ld-map-panel").getBoundingClientRect(), k = sb.width / 975;
+      const sb = svgEl.getBoundingClientRect(), pb = $("ld-map-panel").getBoundingClientRect(), k = sb.width / scaleW;
       placeTip($("tip3"), "ld-map-panel", sb.left - pb.left + cxy[0] * k, sb.top - pb.top + cxy[1] * k);
     }
     if (HAS_MAP) {
@@ -974,6 +1026,15 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
       msvg.addEventListener("focusin", (e) => { const t = hit(e); if (t) mapTip(t.__race, t.__c); });
       msvg.addEventListener("focusout", () => { $("tip3").hidden = true; });
     }
+
+    { const hitT = (e) => { const g = e.target && e.target.closest ? e.target.closest("g.tile") : null; return g && g.__race ? g : null; };
+      const tipT = (g) => mapTip(g.__race, g.__c, tsvg, tsvg.__W);
+      tsvg.addEventListener("pointermove", (e) => { const g = hitT(e); if (g) tipT(g); else $("tip3").hidden = true; });
+      tsvg.addEventListener("pointerleave", () => { $("tip3").hidden = true; });
+      tsvg.addEventListener("click", (e) => { const g = hitT(e); if (g) pick(g.__race.id, false); });
+      tsvg.addEventListener("keydown", (e) => { const g = hitT(e); if (g && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); pick(g.__race.id, false); } });
+      tsvg.addEventListener("focusin", (e) => { const g = hitT(e); if (g) tipT(g); });
+      tsvg.addEventListener("focusout", () => { $("tip3").hidden = true; }); }
 
     // share of the office's races in each group, by day (drag along it to move the date)
     const shareCache = {};
@@ -1034,12 +1095,17 @@ const DATA = {"sets":["All races with polls","Competitive races","The same 62 ra
     }
     raceSel.addEventListener("change", () => pick(raceSel.value, false));
     const officeBtns = () => segBtns("ld-office", [["Senate", "Senate"], ["Governor", "Governor"], ["House", "House"]], () => ld.office,
-      (k) => { ld.office = k; $("tip3").hidden = true; drawMap(); drawShare(); });
+      (k) => { ld.office = k; $("tip3").hidden = true; viewBtns(); drawMap(); drawShare(); });
     officeBtns();
+    function viewBtns() {
+      segBtns("ld-view", [["tiles", "Tiles"], ["geo", "Map"]], () => (ld.office === "House" ? "geo" : ld.view), (k) => { ld.view = k; $("tip3").hidden = true; drawMap(); });
+      const tb = $("ld-view").querySelector("button"); tb.disabled = ld.office === "House"; tb.title = ld.office === "House" ? "House districts need the map" : "";
+    }
+    viewBtns();
     segBtns("ld-mode", MODES, () => ld.mode, (k) => { ld.mode = k; $("tip3").hidden = true; drawKey(); paintMap(); drawShare(); });
     function pick(id, scroll) {
       ld.race = id; raceSel.value = id; const r = LD.races[idxOf[id]];
-      if (r.office !== ld.office) { ld.office = r.office; officeBtns(); drawMap(); drawShare(); } else paintMap();
+      if (r.office !== ld.office) { ld.office = r.office; officeBtns(); viewBtns(); drawMap(); drawShare(); } else paintMap();
       drawRace();
       if (scroll) $("ld-race-sec").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
     }
